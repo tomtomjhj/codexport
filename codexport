@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Export Codex session JSONL logs to Markdown."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+
+def _safe_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(obj)
+
+
+def _extract_text_from_content(content: Any) -> str:
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+
+        for key in ("output_text", "input_text"):
+            value = item.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+                break
+
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}\n\n... (truncated {len(text) - max_chars} chars)"
+
+
+def _emit_message(
+    lines: list[str],
+    idx: int,
+    timestamp: str,
+    payload: dict[str, Any],
+    include_timestamp: bool,
+) -> None:
+    role = payload.get("role", "unknown")
+    phase = payload.get("phase")
+    title = f"## {idx}. {role}"
+    if phase:
+        title += f" ({phase})"
+    lines.append(title)
+    lines.append("")
+    if include_timestamp:
+        lines.append(f"- `timestamp`: `{timestamp}`")
+        lines.append("")
+    text = _extract_text_from_content(payload.get("content"))
+    if text:
+        lines.append(text)
+    else:
+        lines.append("_No textual content_")
+    lines.append("")
+
+
+def _emit_reasoning(
+    lines: list[str],
+    idx: int,
+    timestamp: str,
+    payload: dict[str, Any],
+    include_timestamp: bool,
+) -> None:
+    summaries = payload.get("summary")
+    summary_texts: list[str] = []
+    if isinstance(summaries, list):
+        for item in summaries:
+            if isinstance(item, dict):
+                t = item.get("text")
+                if isinstance(t, str) and t.strip():
+                    summary_texts.append(t.strip())
+    text = "\n".join(summary_texts).strip() or "_No public reasoning summary_"
+
+    lines.append(f"## {idx}. reasoning")
+    lines.append("")
+    if include_timestamp:
+        lines.append(f"- `timestamp`: `{timestamp}`")
+        lines.append("")
+    lines.append(text)
+    lines.append("")
+
+
+def _emit_function_call(
+    lines: list[str],
+    idx: int,
+    timestamp: str,
+    payload: dict[str, Any],
+    include_timestamp: bool,
+) -> None:
+    name = payload.get("name", "unknown")
+    call_id = payload.get("call_id", "unknown")
+    arguments = payload.get("arguments", "")
+
+    lines.append(f"## {idx}. tool_call `{name}`")
+    lines.append("")
+    if include_timestamp:
+        lines.append(f"- `timestamp`: `{timestamp}`")
+    lines.append(f"- `call_id`: `{call_id}`")
+    lines.append("")
+    lines.append("```json")
+    if isinstance(arguments, str):
+        lines.append(arguments)
+    else:
+        lines.append(_safe_json(arguments))
+    lines.append("```")
+    lines.append("")
+
+
+def _emit_function_call_output(
+    lines: list[str],
+    idx: int,
+    timestamp: str,
+    payload: dict[str, Any],
+    max_tool_output_chars: int,
+    include_timestamp: bool,
+) -> None:
+    call_id = payload.get("call_id", "unknown")
+    output = payload.get("output", "")
+    output_str = output if isinstance(output, str) else _safe_json(output)
+    output_str = _truncate(output_str, max_tool_output_chars)
+
+    lines.append(f"## {idx}. tool_output")
+    lines.append("")
+    if include_timestamp:
+        lines.append(f"- `timestamp`: `{timestamp}`")
+    lines.append(f"- `call_id`: `{call_id}`")
+    lines.append("")
+    lines.append("```text")
+    lines.append(output_str)
+    lines.append("```")
+    lines.append("")
+
+
+def export_session(
+    input_path: Path,
+    include_all: bool,
+    max_tool_output_chars: int,
+) -> str:
+    lines: list[str] = []
+    session_meta: dict[str, Any] | None = None
+    section_index = 1
+
+    with input_path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            row_type = row.get("type")
+            timestamp = str(row.get("timestamp", "unknown"))
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+
+            if row_type == "session_meta":
+                session_meta = payload
+                continue
+
+            if row_type == "response_item":
+                item_type = payload.get("type")
+                if item_type == "message":
+                    role = payload.get("role", "unknown")
+                    phase = payload.get("phase")
+                    text = _extract_text_from_content(payload.get("content"))
+                    if include_all or _should_include_default_chat_message(
+                        role=role, phase=phase, text=text
+                    ):
+                        _emit_message(
+                            lines,
+                            section_index,
+                            timestamp,
+                            payload,
+                            include_timestamp=include_all,
+                        )
+                        section_index += 1
+                elif item_type == "reasoning":
+                    if include_all:
+                        _emit_reasoning(
+                            lines,
+                            section_index,
+                            timestamp,
+                            payload,
+                            include_timestamp=True,
+                        )
+                        section_index += 1
+                elif item_type == "function_call":
+                    if include_all:
+                        _emit_function_call(
+                            lines,
+                            section_index,
+                            timestamp,
+                            payload,
+                            include_timestamp=True,
+                        )
+                        section_index += 1
+                elif item_type == "function_call_output":
+                    if include_all:
+                        _emit_function_call_output(
+                            lines,
+                            section_index,
+                            timestamp,
+                            payload,
+                            max_tool_output_chars=max_tool_output_chars,
+                            include_timestamp=True,
+                        )
+                        section_index += 1
+                continue
+
+            if row_type == "event_msg" and include_all:
+                event_type = payload.get("type", "unknown")
+                lines.append(f"## {section_index}. event `{event_type}`")
+                lines.append("")
+                lines.append(f"- `timestamp`: `{timestamp}`")
+                lines.append("")
+                lines.append("```json")
+                lines.append(_safe_json(payload))
+                lines.append("```")
+                lines.append("")
+                section_index += 1
+                continue
+
+            if row_type == "turn_context" and include_all:
+                lines.append(f"## {section_index}. turn_context")
+                lines.append("")
+                lines.append(f"- `timestamp`: `{timestamp}`")
+                lines.append("")
+                lines.append("```json")
+                lines.append(_safe_json(payload))
+                lines.append("```")
+                lines.append("")
+                section_index += 1
+
+    out: list[str] = []
+    out.append(f"# Codex Session Export: `{input_path.name}`")
+    out.append("")
+
+    if session_meta:
+        out.append("## Session Metadata")
+        out.append("")
+        for key in (
+            "id",
+            "timestamp",
+            "cwd",
+            "originator",
+            "cli_version",
+            "source",
+            "model_provider",
+        ):
+            if key == "timestamp" and not include_all:
+                continue
+            if key in session_meta:
+                out.append(f"- `{key}`: `{session_meta[key]}`")
+        out.append("")
+
+    out.append("## Timeline")
+    out.append("")
+    if lines:
+        out.extend(lines)
+    else:
+        out.append("_No exportable timeline items found_")
+        out.append("")
+
+    return "\n".join(out)
+
+
+def _should_include_default_chat_message(role: Any, phase: Any, text: str) -> bool:
+    role_str = str(role)
+    phase_str = str(phase) if phase is not None else ""
+
+    if role_str in {"developer", "system"}:
+        return False
+    if role_str == "assistant" and phase_str == "commentary":
+        return False
+
+    lowered = text.lower()
+    setup_markers = (
+        "<instructions>",
+        "</instructions>",
+        "<environment_context>",
+        "</environment_context>",
+        "<permissions instructions>",
+        "</permissions instructions>",
+        "<collaboration_mode>",
+        "</collaboration_mode>",
+        "# agents.md instructions",
+    )
+    if any(marker in lowered for marker in setup_markers):
+        return False
+
+    return bool(text.strip())
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("input", type=Path, help="Path to Codex session JSONL file.")
+    p.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output Markdown path. Defaults to <input>.md",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="Include all records (reasoning, tool calls/outputs, events, turn contexts).",
+    )
+    p.add_argument(
+        "--max-tool-output-chars",
+        type=int,
+        default=4000,
+        help="Max chars for each function_call_output block before truncation.",
+    )
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    input_path: Path = args.input
+    if not input_path.exists():
+        raise SystemExit(f"Input file not found: {input_path}")
+    if not input_path.is_file():
+        raise SystemExit(f"Input path is not a file: {input_path}")
+
+    output_path: Path = args.output or input_path.with_suffix(input_path.suffix + ".md")
+    md = export_session(
+        input_path=input_path,
+        include_all=args.all,
+        max_tool_output_chars=args.max_tool_output_chars,
+    )
+    output_path.write_text(md, encoding="utf-8")
+    print(f"Wrote {output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
