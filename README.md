@@ -20,6 +20,7 @@ Launch an interactive session selector (reads from `~/.codex/sessions`):
 
 The selector shows each session's creation/update timestamps (in local machine time),
 cwd, git branch (if present), and first user prompt.
+After selecting a session, you'll be prompted for an output file path.
 
 Default mode exports only chat messages:
 

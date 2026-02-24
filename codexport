@@ -537,10 +537,27 @@ def _select_session_path(session_dir: Path) -> Path:
         print("Invalid selection. Please enter a valid number.")
 
 
+def _select_output_path(default_output: Path) -> Path:
+    while True:
+        try:
+            raw = input(f"Output file path (default: {default_output}): ").strip()
+        except EOFError:
+            return default_output
+        if not raw:
+            return default_output
+
+        candidate = Path(raw).expanduser()
+        if candidate.exists() and candidate.is_dir():
+            print("Output path is a directory. Please enter a file path.")
+            continue
+        return candidate
+
+
 def main() -> int:
     args = parse_args()
     input_path: Path | None = args.input
     session_dir = args.session_dir.expanduser()
+    used_interactive_selector = input_path is None and sys.stdin.isatty()
     if input_path is None:
         input_path = _select_session_path(session_dir)
     else:
@@ -550,11 +567,13 @@ def main() -> int:
     if not input_path.is_file():
         raise SystemExit(f"Input path is not a file: {input_path}")
 
-    output_path: Path = (
-        args.output.expanduser()
-        if args.output
-        else input_path.with_suffix(input_path.suffix + ".md")
-    )
+    default_output = input_path.with_suffix(input_path.suffix + ".md")
+    if args.output:
+        output_path = args.output.expanduser()
+    elif used_interactive_selector:
+        output_path = _select_output_path(default_output)
+    else:
+        output_path = default_output
     md = export_session(
         input_path=input_path,
         include_all=args.all,
