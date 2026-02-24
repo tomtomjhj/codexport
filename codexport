@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -313,7 +316,12 @@ def _should_include_default_chat_message(role: Any, phase: Any, text: str) -> bo
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("input", type=Path, help="Path to Codex session JSONL file.")
+    p.add_argument(
+        "input",
+        type=Path,
+        nargs="?",
+        help="Path to Codex session JSONL file. If omitted, an interactive selector is used.",
+    )
     p.add_argument(
         "-o",
         "--output",
@@ -332,18 +340,221 @@ def parse_args() -> argparse.Namespace:
         default=4000,
         help="Max chars for each function_call_output block before truncation.",
     )
+    p.add_argument(
+        "--session-dir",
+        type=Path,
+        default=Path.home() / ".codex" / "sessions",
+        help="Directory containing session JSONL files used by the selector.",
+    )
     return p.parse_args()
+
+
+def _find_session_files(session_dir: Path) -> list[Path]:
+    files: list[Path] = []
+    if not session_dir.exists():
+        return files
+    for path in session_dir.rglob("*.jsonl"):
+        if not path.is_file():
+            continue
+        files.append(path)
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files
+
+
+@dataclass
+class SessionSummary:
+    path: Path
+    created_at: datetime | None
+    updated_at: datetime | None
+    cwd: str | None
+    branch: str | None
+    first_user_prompt: str | None
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _format_timestamp(value: datetime | None) -> str:
+    if value is None:
+        return "unknown"
+    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _summarize_prompt(text: str, max_chars: int = 110) -> str:
+    single_line = " ".join(text.split())
+    if len(single_line) <= max_chars:
+        return single_line
+    return single_line[: max_chars - 3].rstrip() + "..."
+
+
+def _read_session_summary(path: Path) -> SessionSummary:
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    cwd: str | None = None
+    branch: str | None = None
+    first_user_prompt: str | None = None
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+
+                try:
+                    row = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                row_timestamp = _parse_timestamp(row.get("timestamp"))
+                if row_timestamp is not None:
+                    if created_at is None or row_timestamp < created_at:
+                        created_at = row_timestamp
+                    if updated_at is None or row_timestamp > updated_at:
+                        updated_at = row_timestamp
+
+                row_type = row.get("type")
+                payload = row.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                if row_type == "session_meta":
+                    meta_timestamp = _parse_timestamp(payload.get("timestamp"))
+                    if meta_timestamp is not None and (
+                        created_at is None or meta_timestamp < created_at
+                    ):
+                        created_at = meta_timestamp
+
+                    cwd_value = payload.get("cwd")
+                    if isinstance(cwd_value, str) and cwd_value.strip():
+                        cwd = cwd_value.strip()
+
+                    git_info = payload.get("git")
+                    if isinstance(git_info, dict):
+                        value = git_info.get("branch")
+                        if isinstance(value, str) and value.strip():
+                            branch = value.strip()
+
+                if row_type == "turn_context" and cwd is None:
+                    cwd_value = payload.get("cwd")
+                    if isinstance(cwd_value, str) and cwd_value.strip():
+                        cwd = cwd_value.strip()
+
+                if first_user_prompt is None and row_type == "response_item":
+                    if payload.get("type") != "message":
+                        continue
+                    role = payload.get("role", "unknown")
+                    phase = payload.get("phase")
+                    text = _extract_text_from_content(payload.get("content"))
+                    if role == "user" and _should_include_default_chat_message(
+                        role=role,
+                        phase=phase,
+                        text=text,
+                    ):
+                        first_user_prompt = _summarize_prompt(text)
+    except OSError:
+        pass
+
+    if created_at is None or updated_at is None:
+        stat = path.stat()
+        mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        if created_at is None:
+            created_at = mtime
+        if updated_at is None:
+            updated_at = mtime
+
+    return SessionSummary(
+        path=path,
+        created_at=created_at,
+        updated_at=updated_at,
+        cwd=cwd,
+        branch=branch,
+        first_user_prompt=first_user_prompt,
+    )
+
+
+def _format_choice(path: Path, session_dir: Path, summary: SessionSummary) -> str:
+    try:
+        rel = path.relative_to(session_dir)
+        label = str(rel)
+    except ValueError:
+        label = str(path)
+    created = _format_timestamp(summary.created_at)
+    updated = _format_timestamp(summary.updated_at)
+    cwd = summary.cwd or "-"
+    branch = summary.branch or "-"
+    prompt = summary.first_user_prompt or "-"
+    return (
+        f"{label}\n"
+        f"    created: {created} | updated: {updated} | cwd: {cwd} | branch: {branch}\n"
+        f"    prompt: {prompt}"
+    )
+
+
+def _select_session_path(session_dir: Path) -> Path:
+    session_files = _find_session_files(session_dir)
+    if not session_files:
+        raise SystemExit(f"No session files found under: {session_dir}")
+
+    if not sys.stdin.isatty():
+        # In non-interactive contexts, default to the newest session file.
+        chosen = session_files[0]
+        print(f"No input provided; using latest session: {chosen}", file=sys.stderr)
+        return chosen
+
+    shown = session_files[:30]
+    summaries = [_read_session_summary(path) for path in shown]
+    print(f"Select a session file from: {session_dir}")
+    for idx, (path, summary) in enumerate(zip(shown, summaries), start=1):
+        print(f"{idx:2d}. {_format_choice(path, session_dir, summary)}")
+    if len(session_files) > len(shown):
+        print(f"... and {len(session_files) - len(shown)} more (showing newest 30)")
+
+    while True:
+        raw = input(f"Enter selection [1-{len(shown)}] (default 1, q to cancel): ").strip()
+        if not raw:
+            return shown[0]
+        if raw.lower() in {"q", "quit", "exit"}:
+            raise SystemExit("Session selection cancelled.")
+        if raw.isdigit():
+            selected = int(raw)
+            if 1 <= selected <= len(shown):
+                return shown[selected - 1]
+        print("Invalid selection. Please enter a valid number.")
 
 
 def main() -> int:
     args = parse_args()
-    input_path: Path = args.input
+    input_path: Path | None = args.input
+    session_dir = args.session_dir.expanduser()
+    if input_path is None:
+        input_path = _select_session_path(session_dir)
+    else:
+        input_path = input_path.expanduser()
     if not input_path.exists():
         raise SystemExit(f"Input file not found: {input_path}")
     if not input_path.is_file():
         raise SystemExit(f"Input path is not a file: {input_path}")
 
-    output_path: Path = args.output or input_path.with_suffix(input_path.suffix + ".md")
+    output_path: Path = (
+        args.output.expanduser()
+        if args.output
+        else input_path.with_suffix(input_path.suffix + ".md")
+    )
     md = export_session(
         input_path=input_path,
         include_all=args.all,
